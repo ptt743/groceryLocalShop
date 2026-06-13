@@ -1372,23 +1372,27 @@ def index():
 # ---------------------------------------------------------------------------
 # Khởi chạy: Flask chạy nền, PyWebView mở cửa sổ app
 # ---------------------------------------------------------------------------
+# Cổng cho bản desktop. Dùng 8770 (không phải 5000) vì macOS chiếm 5000 cho AirPlay.
+APP_PORT = int(os.environ.get("PORT", "8770"))
+
+
 def run_flask():
     host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host=host, port=port, threaded=True)
+    app.run(host=host, port=APP_PORT, threaded=True)
 
 
 # Khởi tạo DB ngay khi nạp module (cần cho gunicorn trong Docker, vốn không chạy __main__)
 init_db()
 
 if __name__ == "__main__":
+    url = f"http://127.0.0.1:{APP_PORT}"
     try:
         import webview  # cửa sổ desktop
         threading.Thread(target=run_flask, daemon=True).start()
-        webview.create_window("Bán hàng", "http://127.0.0.1:5000",
+        webview.create_window("Bán hàng", url,
                               width=1180, height=760, min_size=(900, 600))
         webview.start()
     except ImportError:
-        # Chưa cài pywebview -> chạy như web thường, mở trình duyệt vào localhost:5000
-        print("Chưa có pywebview. Mở trình duyệt: http://127.0.0.1:5000")
+        # Chưa cài pywebview -> chạy như web thường, mở trình duyệt vào địa chỉ này
+        print("Chưa có pywebview. Mở trình duyệt: " + url)
         run_flask()
