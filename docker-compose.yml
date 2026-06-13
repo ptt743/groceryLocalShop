@@ -1,0 +1,10 @@
+services:
+  banhang:
+    build: .
+    ports:
+      # cổng máy (8080) -> cổng trong container (5000). Dùng 8080 vì macOS chiếm 5000 cho AirPlay
+      - "8080:5000"
+    volumes:
+      # DB lưu vào thư mục ./data trên máy bạn -> sao lưu = copy thư mục này
+      - ./data:/data
+    restart: unless-stopped   # Docker Desktop bật cùng máy -> app tự chạy lại
