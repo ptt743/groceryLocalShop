@@ -118,6 +118,44 @@ def find_by_barcode(code):
     return jsonify({"error": "not_found"}), 404
 
 
+@app.route("/api/lookup/<code>", methods=["GET"])
+def lookup_openfoodfacts(code):
+    """Tra tên sản phẩm theo mã vạch trên Open Food Facts (nguồn mở).
+    Gọi từ server để gắn được User-Agent theo yêu cầu của OFF.
+    Luôn trả 200; nếu không có mạng / không tìm thấy thì found=false."""
+    import urllib.request
+    import json as _json
+
+    code = code.strip()
+    url = (
+        "https://world.openfoodfacts.org/api/v2/product/"
+        f"{code}.json?fields=product_name,product_name_vi,brands,quantity"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "BanHangLocal/1.0 (pos-local-app)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return jsonify({"found": False})
+
+    if data.get("status") == 1:
+        p = data.get("product", {}) or {}
+        name = (p.get("product_name_vi") or p.get("product_name") or "").strip()
+        qty = (p.get("quantity") or "").strip()
+        full = name
+        if qty and qty.lower() not in name.lower():
+            full = (name + " " + qty).strip()
+        return jsonify({
+            "found": bool(name),
+            "name": full,
+            "brand": (p.get("brands") or "").strip(),
+        })
+    return jsonify({"found": False})
+
+
 @app.route("/api/products", methods=["POST"])
 def add_product():
     d = request.get_json(force=True)
@@ -714,6 +752,18 @@ PAGE = r"""
     background:var(--ink);color:#fff;padding:11px 18px;border-radius:8px;opacity:0;
     transition:.2s;pointer-events:none;font-size:14px;z-index:50}
   #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+  /* hộp thoại thêm sản phẩm mới */
+  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;
+    align-items:center;justify-content:center;z-index:60;padding:20px}
+  .modal-overlay.show{display:flex}
+  .modal{background:#fff;border-radius:var(--radius);padding:22px;width:100%;max-width:380px;
+    box-shadow:0 12px 48px rgba(0,0,0,.25)}
+  .modal h2{margin-top:0}
+  .np-code-row{color:var(--muted);font-size:14px;margin-bottom:14px}
+  .modal .field{margin-bottom:12px}
+  .modal-actions{display:flex;gap:8px;margin-top:6px}
+  .modal-actions .btn{flex:1}
 </style>
 </head>
 <body>
@@ -845,6 +895,26 @@ PAGE = r"""
 
 <div id="toast"></div>
 
+<!-- Hộp thoại thêm nhanh sản phẩm mới khi đang bán -->
+<div id="newProductModal" class="modal-overlay">
+  <div class="modal">
+    <h2>Sản phẩm mới</h2>
+    <div class="np-code-row">Mã vạch: <span id="np-code" class="num"></span></div>
+    <input type="hidden" id="np-barcode">
+    <div class="field"><label>Tên sản phẩm</label><input id="np-name" autocomplete="off"></div>
+    <div class="field"><label>Giá bán (₫)</label>
+      <input id="np-price" inputmode="numeric" autocomplete="off"
+             onkeydown="if(event.key==='Enter')confirmNewProduct()"></div>
+    <div class="field"><label>Tồn kho (tuỳ chọn)</label>
+      <input id="np-stock" inputmode="numeric" autocomplete="off"
+             onkeydown="if(event.key==='Enter')confirmNewProduct()"></div>
+    <div class="modal-actions">
+      <button class="btn" onclick="confirmNewProduct()">Thêm & vào giỏ</button>
+      <button class="btn ghost" onclick="closeNewProductModal()">Huỷ</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const fmt = n => (Number(n)||0).toLocaleString('vi-VN') + ' ₫';
 const api = (url, opt) => fetch(url, opt).then(r => r.ok ? r.json() : r.json().then(e=>Promise.reject(e)));
@@ -961,9 +1031,50 @@ function processScan(){
   el.value = '';                 // xoá ngay để tránh xử lý trùng (lần gọi sau thấy rỗng sẽ bỏ qua)
   if(!code) return;
   api('/api/products/barcode/' + encodeURIComponent(code))
-    .then(p=>{ addToCart(p); toast('Đã thêm ' + p.name); })
-    .catch(()=> toast('Không tìm thấy mã: ' + code))
-    .finally(()=> el.focus());
+    .then(p=>{ addToCart(p); toast('Đã thêm ' + p.name); el.focus(); })
+    .catch(()=>{
+      // chưa có trong kho -> tra Open Food Facts rồi mở hộp thoại nhập giá
+      toast('Mã mới — đang tra thông tin…');
+      api('/api/lookup/' + encodeURIComponent(code))
+        .then(d=> openNewProductModal(code, d.found ? d.name : ''))
+        .catch(()=> openNewProductModal(code, ''));
+    });
+}
+
+// hộp thoại thêm nhanh sản phẩm mới ngay khi đang bán
+function openNewProductModal(code, name){
+  document.getElementById('np-code').textContent = code;
+  document.getElementById('np-barcode').value = code;
+  document.getElementById('np-name').value = name || '';
+  document.getElementById('np-price').value = '';
+  document.getElementById('np-stock').value = '';
+  document.getElementById('newProductModal').classList.add('show');
+  setTimeout(()=>{
+    (name ? document.getElementById('np-price') : document.getElementById('np-name')).focus();
+  }, 50);
+}
+
+function confirmNewProduct(){
+  const name = document.getElementById('np-name').value.trim();
+  const barcode = document.getElementById('np-barcode').value.trim();
+  const price = parseInt((document.getElementById('np-price').value||'').replace(/\D/g,''))||0;
+  const stock = parseInt((document.getElementById('np-stock').value||'').replace(/\D/g,''))||0;
+  if(!name){ toast('Nhập tên sản phẩm'); document.getElementById('np-name').focus(); return; }
+  if(price<=0){ toast('Nhập giá bán'); document.getElementById('np-price').focus(); return; }
+  api('/api/products',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name, barcode, price, stock})})
+    .then(p=>{
+      addToCart(p);                 // luồng giỏ hàng
+      toast('Đã thêm "'+p.name+'" vào kho & giỏ');
+      closeNewProductModal();
+      loadSaleList();               // luồng cập nhật danh sách sản phẩm
+    })
+    .catch(e=> toast(e.error||'Lỗi thêm sản phẩm'));
+}
+
+function closeNewProductModal(){
+  document.getElementById('newProductModal').classList.remove('show');
+  document.getElementById('scan').focus();
 }
 
 document.addEventListener('DOMContentLoaded',()=>{
@@ -1002,7 +1113,22 @@ function processFormBarcode(){
   lastBarcode = code;
   api('/api/products/barcode/' + encodeURIComponent(code))
     .then(p=>{ editProduct(p); toast('Mã này đã có — đang sửa "' + p.name + '"'); })
-    .catch(()=>{ toast('Mã mới — nhập tên & giá'); document.getElementById('f-name').focus(); });
+    .catch(()=>{
+      // chưa có trong kho -> hỏi Open Food Facts để gợi ý tên
+      toast('Mã mới — đang tra thông tin…');
+      api('/api/lookup/' + encodeURIComponent(code))
+        .then(d=>{
+          if(d.found && d.name){
+            document.getElementById('f-name').value = d.name;
+            toast('Đã điền tên: ' + d.name + ' — nhập giá & tồn');
+            document.getElementById('f-price').focus();
+          } else {
+            toast('Không có sẵn thông tin — nhập tên tay');
+            document.getElementById('f-name').focus();
+          }
+        })
+        .catch(()=>{ document.getElementById('f-name').focus(); });
+    });
 }
 
 /* ---------- SẢN PHẨM ---------- */
