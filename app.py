@@ -18,7 +18,8 @@ import os
 import sys
 import sqlite3
 import threading
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # ---------------------------------------------------------------------------
 # Đường dẫn DB: đặt cạnh app.py khi dev, cạnh .exe khi đã đóng gói.
@@ -59,7 +60,7 @@ def init_db():
             total     INTEGER NOT NULL,
             paid      INTEGER NOT NULL,
             change    INTEGER NOT NULL,
-            created_at TEXT   NOT NULL DEFAULT (datetime('now','localtime'))
+            created_at TEXT   NOT NULL DEFAULT (datetime('now','+7 hours'))
         );
 
         CREATE TABLE IF NOT EXISTS sale_items (
@@ -75,7 +76,12 @@ def init_db():
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             phone      TEXT    NOT NULL,
             amount     INTEGER NOT NULL,
-            created_at TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+            created_at TEXT    NOT NULL DEFAULT (datetime('now','+7 hours'))
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
         );
         """
     )
@@ -83,6 +89,39 @@ def init_db():
     cols = [r[1] for r in conn.execute("PRAGMA table_info(sales)").fetchall()]
     if "debtor_phone" not in cols:
         conn.execute("ALTER TABLE sales ADD COLUMN debtor_phone TEXT")
+
+    # mật khẩu mặc định "123456" (lưu dạng băm) nếu chưa có
+    row = conn.execute("SELECT value FROM settings WHERE key='password_hash'").fetchone()
+    if not row:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('password_hash', ?)",
+            (generate_password_hash("123456"),),
+        )
+    # khoá ký session, ổn định qua các lần khởi động lại
+    row = conn.execute("SELECT value FROM settings WHERE key='secret_key'").fetchone()
+    if not row:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('secret_key', ?)",
+            (os.urandom(24).hex(),),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_setting(key):
+    conn = get_db()
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else None
+
+
+def set_setting(key, value):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
     conn.commit()
     conn.close()
 
@@ -234,7 +273,8 @@ def checkout():
 
     conn = get_db()
     cur = conn.execute(
-        "INSERT INTO sales (total, paid, change, debtor_phone) VALUES (?,?,?,?)",
+        "INSERT INTO sales (total, paid, change, debtor_phone, created_at) "
+        "VALUES (?,?,?,?, datetime('now','+7 hours'))",
         (total, paid, max(change, 0), phone or None),
     )
     sale_id = cur.lastrowid
@@ -265,7 +305,7 @@ def list_sales():
     # ngày đang xem (mặc định: hôm nay)
     day = (request.args.get("date") or "").strip()
     if not day:
-        row = conn.execute("SELECT date('now','localtime') AS d").fetchone()
+        row = conn.execute("SELECT date('now','+7 hours') AS d").fetchone()
         day = row["d"]
 
     sales = conn.execute(
@@ -311,7 +351,7 @@ def revenue_yearly():
     year = (request.args.get("year") or "").strip()
     if not year:
         year = conn.execute(
-            "SELECT strftime('%Y','now','localtime') AS y"
+            "SELECT strftime('%Y','now','+7 hours') AS y"
         ).fetchone()["y"]
 
     # doanh thu & số đơn từng tháng trong năm
@@ -363,10 +403,28 @@ def export_excel():
 
     head_fill = PatternFill("solid", fgColor="0F766E")
 
-    # ----- Xuất báo cáo theo NĂM: tổng hợp 12 tháng -----
+    # ----- Xuất báo cáo theo NĂM: chi tiết + theo sản phẩm + theo tháng -----
     year = (request.args.get("year") or "").strip()
     if year:
         conn = get_db()
+        # chi tiết từng món của từng đơn trong năm
+        detail = conn.execute(
+            "SELECT s.id, s.created_at, i.name, p.barcode AS barcode, i.price, i.qty, s.total, s.debtor_phone "
+            "FROM sales s JOIN sale_items i ON i.sale_id=s.id "
+            "LEFT JOIN products p ON p.id = i.product_id "
+            "WHERE strftime('%Y', s.created_at)=? ORDER BY s.id, i.id",
+            (year,),
+        ).fetchall()
+        # tổng hợp theo sản phẩm
+        by_product = conn.execute(
+            "SELECT i.name AS name, MAX(p.barcode) AS barcode, "
+            "SUM(i.qty) AS qty, SUM(i.price*i.qty) AS amount "
+            "FROM sales s JOIN sale_items i ON i.sale_id=s.id "
+            "LEFT JOIN products p ON p.id = i.product_id "
+            "WHERE strftime('%Y', s.created_at)=? GROUP BY i.name ORDER BY amount DESC",
+            (year,),
+        ).fetchall()
+        # tổng hợp theo tháng
         rows = conn.execute(
             "SELECT strftime('%m', created_at) AS m, "
             "COALESCE(SUM(total),0) AS revenue, COUNT(*) AS count "
@@ -376,32 +434,71 @@ def export_excel():
         conn.close()
         by_month = {r["m"]: r for r in rows}
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = f"Doanh thu {year}"
-        ws.append(["Tháng", "Số đơn", "Doanh thu"])
-        for c in ws[1]:
-            c.font = Font(bold=True, color="FFFFFF")
-            c.fill = head_fill
-            c.alignment = Alignment(horizontal="center")
+        def style_header(ws):
+            for c in ws[1]:
+                c.font = Font(bold=True, color="FFFFFF")
+                c.fill = head_fill
+                c.alignment = Alignment(horizontal="center")
 
+        wb = Workbook()
+
+        # ===== Sheet 1: Chi tiết =====
+        ws = wb.active
+        ws.title = "Chi tiết"
+        ws.append(["Mã đơn", "Thời gian", "Sản phẩm", "Mã vạch", "Đơn giá", "Số lượng", "Thành tiền", "Loại"])
+        style_header(ws)
+        grand_total = 0
+        seen = set()
+        for r in detail:
+            line = r["price"] * r["qty"]
+            kind = "Nợ" if r["debtor_phone"] else "Bán"
+            ws.append([r["id"], r["created_at"], r["name"], r["barcode"] or "",
+                       r["price"], r["qty"], line, kind])
+            if r["id"] not in seen:
+                grand_total += r["total"]
+                seen.add(r["id"])
+        ws.append([])
+        ws.append(["", "", "", "", "", "Tổng doanh thu", grand_total, ""])
+        for c in ws[ws.max_row]:
+            c.font = Font(bold=True)
+        for col, w in zip("ABCDEFGH", [10, 20, 32, 16, 14, 10, 16, 8]):
+            ws.column_dimensions[col].width = w
+        for row in ws.iter_rows(min_row=2, min_col=5, max_col=7):
+            for c in row:
+                if isinstance(c.value, (int, float)):
+                    c.number_format = "#,##0"
+
+        # ===== Sheet 2: Theo sản phẩm =====
+        ws2 = wb.create_sheet("Theo sản phẩm")
+        ws2.append(["Sản phẩm", "Mã vạch", "Số lượng bán", "Doanh thu"])
+        style_header(ws2)
+        for r in by_product:
+            ws2.append([r["name"], r["barcode"] or "", r["qty"], r["amount"]])
+        for col, w in zip("ABCD", [32, 16, 14, 18]):
+            ws2.column_dimensions[col].width = w
+        for row in ws2.iter_rows(min_row=2, min_col=4, max_col=4):
+            for c in row:
+                if isinstance(c.value, (int, float)):
+                    c.number_format = "#,##0"
+
+        # ===== Sheet 3: Theo tháng =====
+        ws3 = wb.create_sheet("Theo tháng")
+        ws3.append(["Tháng", "Số đơn", "Doanh thu"])
+        style_header(ws3)
         year_total = 0
         for i in range(1, 13):
             r = by_month.get(f"{i:02d}")
             rev = r["revenue"] if r else 0
             cnt = r["count"] if r else 0
             year_total += rev
-            ws.append([f"Tháng {i}", cnt, rev])
-
-        ws.append([])
-        ws.append(["Tổng cả năm", "", year_total])
-        for c in ws[ws.max_row]:
+            ws3.append([f"Tháng {i}", cnt, rev])
+        ws3.append([])
+        ws3.append(["Tổng cả năm", "", year_total])
+        for c in ws3[ws3.max_row]:
             c.font = Font(bold=True)
-
-        ws.column_dimensions["A"].width = 16
-        ws.column_dimensions["B"].width = 12
-        ws.column_dimensions["C"].width = 18
-        for row in ws.iter_rows(min_row=2, min_col=3, max_col=3):
+        for col, w in zip("ABC", [16, 12, 18]):
+            ws3.column_dimensions[col].width = w
+        for row in ws3.iter_rows(min_row=2, min_col=3, max_col=3):
             for c in row:
                 if isinstance(c.value, (int, float)):
                     c.number_format = "#,##0"
@@ -421,16 +518,18 @@ def export_excel():
     conn = get_db()
     if day and day != "all":
         rows = conn.execute(
-            "SELECT s.id, s.created_at, i.name, i.price, i.qty, s.total, s.paid, s.change "
+            "SELECT s.id, s.created_at, i.name, p.barcode AS barcode, i.price, i.qty, s.total, s.debtor_phone "
             "FROM sales s JOIN sale_items i ON i.sale_id=s.id "
+            "LEFT JOIN products p ON p.id = i.product_id "
             "WHERE date(s.created_at)=? ORDER BY s.id, i.id",
             (day,),
         ).fetchall()
         fname = f"doanh-thu-{day}.xlsx"
     else:
         rows = conn.execute(
-            "SELECT s.id, s.created_at, i.name, i.price, i.qty, s.total, s.paid, s.change "
+            "SELECT s.id, s.created_at, i.name, p.barcode AS barcode, i.price, i.qty, s.total, s.debtor_phone "
             "FROM sales s JOIN sale_items i ON i.sale_id=s.id "
+            "LEFT JOIN products p ON p.id = i.product_id "
             "ORDER BY s.id, i.id"
         ).fetchall()
         fname = "doanh-thu-tat-ca.xlsx"
@@ -440,7 +539,7 @@ def export_excel():
     ws = wb.active
     ws.title = "Doanh thu"
 
-    headers = ["Mã đơn", "Thời gian", "Sản phẩm", "Đơn giá", "Số lượng", "Thành tiền"]
+    headers = ["Mã đơn", "Thời gian", "Sản phẩm", "Mã vạch", "Đơn giá", "Số lượng", "Thành tiền", "Loại"]
     ws.append(headers)
     head_fill = PatternFill("solid", fgColor="0F766E")
     for c in ws[1]:
@@ -452,24 +551,25 @@ def export_excel():
     seen_orders = set()
     for r in rows:
         line_total = r["price"] * r["qty"]
-        ws.append([r["id"], r["created_at"], r["name"], r["price"], r["qty"], line_total])
+        kind = "Nợ" if r["debtor_phone"] else "Bán"
+        ws.append([r["id"], r["created_at"], r["name"], r["barcode"] or "",
+                   r["price"], r["qty"], line_total, kind])
         if r["id"] not in seen_orders:
             grand_total += r["total"]
             seen_orders.add(r["id"])
 
     # dòng tổng
     ws.append([])
-    total_row = ["", "", "", "", "Tổng doanh thu", grand_total]
-    ws.append(total_row)
+    ws.append(["", "", "", "", "", "Tổng doanh thu", grand_total, ""])
     last = ws.max_row
     for c in ws[last]:
         c.font = Font(bold=True)
 
     # định dạng cột tiền + độ rộng
-    widths = [10, 20, 30, 14, 10, 16]
+    widths = [10, 20, 30, 16, 14, 10, 16, 8]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[chr(64 + i)].width = w
-    for row in ws.iter_rows(min_row=2, min_col=4):
+    for row in ws.iter_rows(min_row=2, min_col=5, max_col=7):
         for c in row:
             if isinstance(c.value, (int, float)):
                 c.number_format = "#,##0"
@@ -555,7 +655,9 @@ def pay_debt(phone):
 
     conn = get_db()
     conn.execute(
-        "INSERT INTO debt_payments (phone, amount) VALUES (?,?)", (phone, amount)
+        "INSERT INTO debt_payments (phone, amount, created_at) "
+        "VALUES (?,?, datetime('now','+7 hours'))",
+        (phone, amount),
     )
     conn.commit()
     debt_total = conn.execute(
@@ -612,6 +714,22 @@ PAGE = r"""
   }
   nav button:hover{background:var(--surface)}
   nav button.active{background:var(--ink);color:#fff}
+
+  .header-right{margin-left:auto;display:flex;gap:4px}
+  .link-btn{border:0;background:none;color:var(--muted);padding:8px 12px;border-radius:8px;cursor:pointer;font-size:14px;font-family:inherit}
+  .link-btn:hover{background:var(--surface);color:var(--ink)}
+
+  /* màn hình đăng nhập */
+  .login-screen{position:fixed;inset:0;background:var(--bg);display:none;
+    align-items:center;justify-content:center;z-index:100}
+  .login-screen.show{display:flex}
+  .login-card{width:100%;max-width:320px;text-align:center;padding:24px}
+  .login-card h1{font-size:26px;margin:0 0 4px;letter-spacing:-.02em}
+  .login-sub{color:var(--muted);margin:0 0 22px}
+  .login-card input{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:8px;
+    font-size:16px;outline:none;margin-bottom:12px;font-family:inherit;text-align:center}
+  .login-card input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .login-card .btn{width:100%}
 
   main{padding:22px;max-width:1180px;margin:0 auto}
   .hide{display:none}
@@ -725,6 +843,7 @@ PAGE = r"""
 
   /* ====== SỔ NỢ ====== */
   .btn-debt{background:#b45309}            /* cam đất, phân biệt với nút thanh toán */
+  .btn-red{background:var(--danger)}
   .debt-search{display:flex;gap:10px;margin-bottom:18px;max-width:520px}
   .debt-search input{flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:8px;outline:none;font-size:15px;font-family:inherit}
   .debt-search input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
@@ -746,6 +865,8 @@ PAGE = r"""
     display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600}
   .debtor-phone{flex:1;font-weight:550}
   .debtor-amt{color:var(--danger);font-weight:700}
+  #view-debt .bill{margin-bottom:12px}
+  #view-debt .pay-history .bill-item{padding:10px 2px}
 
   /* toast */
   #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);
@@ -775,6 +896,10 @@ PAGE = r"""
     <button id="tab-hist" onclick="showTab('hist')">Lịch sử</button>
     <button id="tab-debt" onclick="showTab('debt')">Sổ nợ</button>
   </nav>
+  <div class="header-right">
+    <button class="link-btn" onclick="openChangePw()">Đổi mật khẩu</button>
+    <button class="link-btn" onclick="doLogout()">Đăng xuất</button>
+  </div>
 </header>
 
 <main>
@@ -895,6 +1020,33 @@ PAGE = r"""
 
 <div id="toast"></div>
 
+<!-- Màn hình đăng nhập -->
+<div id="loginScreen" class="login-screen">
+  <div class="login-card">
+    <h1>Bán hàng</h1>
+    <p class="login-sub">Nhập mật khẩu để vào</p>
+    <input id="loginPw" type="password" placeholder="Mật khẩu" autocomplete="current-password"
+           onkeydown="if(event.key==='Enter')doLogin()">
+    <button class="btn" onclick="doLogin()">Đăng nhập</button>
+  </div>
+</div>
+
+<!-- Modal đổi mật khẩu -->
+<div id="changePwModal" class="modal-overlay">
+  <div class="modal">
+    <h2>Đổi mật khẩu</h2>
+    <div class="field"><label>Mật khẩu hiện tại</label>
+      <input id="cp-old" type="password" autocomplete="off"></div>
+    <div class="field"><label>Mật khẩu mới</label>
+      <input id="cp-new" type="password" autocomplete="off"
+             onkeydown="if(event.key==='Enter')doChangePw()"></div>
+    <div class="modal-actions">
+      <button class="btn" onclick="doChangePw()">Lưu</button>
+      <button class="btn ghost" onclick="closeChangePw()">Huỷ</button>
+    </div>
+  </div>
+</div>
+
 <!-- Hộp thoại thêm nhanh sản phẩm mới khi đang bán -->
 <div id="newProductModal" class="modal-overlay">
   <div class="modal">
@@ -917,7 +1069,7 @@ PAGE = r"""
 
 <script>
 const fmt = n => (Number(n)||0).toLocaleString('vi-VN') + ' ₫';
-const api = (url, opt) => fetch(url, opt).then(r => r.ok ? r.json() : r.json().then(e=>Promise.reject(e)));
+const api = (url, opt={}) => fetch(url, {cache:'no-store', ...opt}).then(r => r.ok ? r.json() : r.json().then(e=>Promise.reject(e)));
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');
   clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),1800);}
 
@@ -1335,6 +1487,7 @@ function lookupDebt(){
           <input id="payAmount" class="field-inline num" inputmode="numeric" placeholder="Số tiền khách trả"
                  onkeydown="if(event.key==='Enter')payDebt()">
           <button class="btn" onclick="payDebt()">Ghi nhận trả nợ</button>
+          <button class="btn btn-red" onclick="closeDebtDetail()">Xong</button>
         </div>
       </div>
       <div class="debt-cols">
@@ -1355,13 +1508,116 @@ function payDebt(){
     }).catch(e=>toast(e.error||'Lỗi'));
 }
 
+function closeDebtDetail(){
+  document.getElementById('debtResult').innerHTML='';
+  document.getElementById('debtPhone').value='';
+  loadDebtors();
+  window.scrollTo({top:0, behavior:'smooth'});
+  document.getElementById('debtPhone').focus();
+}
+
+/* ---------- ĐĂNG NHẬP ---------- */
+function boot(){
+  api('/api/auth/status').then(d=>{
+    if(d.logged_in) showApp(); else showLogin();
+  }).catch(()=> showLogin());
+}
+function showLogin(){
+  document.getElementById('loginScreen').classList.add('show');
+  setTimeout(()=>document.getElementById('loginPw').focus(), 50);
+}
+function showApp(){
+  document.getElementById('loginScreen').classList.remove('show');
+  renderCart(); loadSaleList();
+  document.getElementById('scan').focus();
+}
+function doLogin(){
+  const pw = document.getElementById('loginPw').value;
+  api('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({password:pw})})
+    .then(()=>{ document.getElementById('loginPw').value=''; showApp(); })
+    .catch(()=>{ toast('Sai mật khẩu'); document.getElementById('loginPw').value=''; document.getElementById('loginPw').focus(); });
+}
+function doLogout(){
+  api('/api/logout',{method:'POST'}).then(()=>{ location.reload(); });
+}
+function openChangePw(){
+  document.getElementById('cp-old').value='';
+  document.getElementById('cp-new').value='';
+  document.getElementById('changePwModal').classList.add('show');
+  setTimeout(()=>document.getElementById('cp-old').focus(), 50);
+}
+function closeChangePw(){ document.getElementById('changePwModal').classList.remove('show'); }
+function doChangePw(){
+  const oldp=document.getElementById('cp-old').value;
+  const newp=document.getElementById('cp-new').value;
+  api('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({old:oldp, new:newp})})
+    .then(()=>{ toast('Đã đổi mật khẩu'); closeChangePw(); })
+    .catch(e=> toast(e.error||'Lỗi đổi mật khẩu'));
+}
+
 // khởi động
-renderCart();
-loadSaleList();
+boot();
 </script>
 </body>
 </html>
 """
+
+
+@app.before_request
+def require_login():
+    """Chặn mọi API nếu chưa đăng nhập (trừ các route đăng nhập/trạng thái)."""
+    p = request.path
+    if p == "/" or p.startswith("/static"):
+        return
+    if p in ("/api/login", "/api/logout", "/api/auth/status"):
+        return
+    if p.startswith("/api/") and not session.get("auth"):
+        return jsonify({"error": "unauthorized"}), 401
+
+
+@app.after_request
+def no_cache_api(resp):
+    """Không cho trình duyệt cache các phản hồi API (tránh thấy trạng thái cũ sau đăng xuất)."""
+    if request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
+@app.route("/api/auth/status", methods=["GET"])
+def auth_status():
+    return jsonify({"logged_in": bool(session.get("auth"))})
+
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    d = request.get_json(force=True)
+    pw = d.get("password") or ""
+    if check_password_hash(get_setting("password_hash") or "", pw):
+        session["auth"] = True
+        return jsonify({"ok": True})
+    return jsonify({"error": "Sai mật khẩu"}), 401
+
+
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/change-password", methods=["POST"])
+def change_password():
+    d = request.get_json(force=True)
+    old = d.get("old") or ""
+    new = (d.get("new") or "").strip()
+    if not check_password_hash(get_setting("password_hash") or "", old):
+        return jsonify({"error": "Mật khẩu hiện tại không đúng"}), 400
+    if len(new) < 4:
+        return jsonify({"error": "Mật khẩu mới phải từ 4 ký tự"}), 400
+    set_setting("password_hash", generate_password_hash(new))
+    return jsonify({"ok": True})
 
 
 @app.route("/")
@@ -1383,6 +1639,7 @@ def run_flask():
 
 # Khởi tạo DB ngay khi nạp module (cần cho gunicorn trong Docker, vốn không chạy __main__)
 init_db()
+app.secret_key = get_setting("secret_key") or os.urandom(24).hex()
 
 if __name__ == "__main__":
     url = f"http://127.0.0.1:{APP_PORT}"
