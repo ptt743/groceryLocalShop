@@ -265,11 +265,118 @@ def list_sales():
     })
 
 
+@app.route("/api/revenue/yearly", methods=["GET"])
+def revenue_yearly():
+    conn = get_db()
+
+    # năm đang xem (mặc định: năm hiện tại)
+    year = (request.args.get("year") or "").strip()
+    if not year:
+        year = conn.execute(
+            "SELECT strftime('%Y','now','localtime') AS y"
+        ).fetchone()["y"]
+
+    # doanh thu & số đơn từng tháng trong năm
+    rows = conn.execute(
+        "SELECT strftime('%m', created_at) AS m, "
+        "COALESCE(SUM(total),0) AS revenue, COUNT(*) AS count "
+        "FROM sales WHERE strftime('%Y', created_at)=? "
+        "GROUP BY m",
+        (year,),
+    ).fetchall()
+    by_month = {r["m"]: r for r in rows}
+    months = []
+    for i in range(1, 13):
+        key = f"{i:02d}"
+        r = by_month.get(key)
+        months.append({
+            "month": i,
+            "revenue": r["revenue"] if r else 0,
+            "count": r["count"] if r else 0,
+        })
+
+    total = conn.execute(
+        "SELECT COALESCE(SUM(total),0) AS t, COUNT(*) AS c "
+        "FROM sales WHERE strftime('%Y', created_at)=?",
+        (year,),
+    ).fetchone()
+
+    # danh sách các năm có giao dịch
+    years = conn.execute(
+        "SELECT strftime('%Y', created_at) AS y FROM sales GROUP BY y ORDER BY y DESC"
+    ).fetchall()
+
+    conn.close()
+    return jsonify({
+        "year": year,
+        "total": total["t"],
+        "count": total["c"],
+        "months": months,
+        "years": [r["y"] for r in years],
+    })
+
+
 @app.route("/api/export", methods=["GET"])
 def export_excel():
     import io
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill
+    from flask import send_file
+
+    head_fill = PatternFill("solid", fgColor="0F766E")
+
+    # ----- Xuất báo cáo theo NĂM: tổng hợp 12 tháng -----
+    year = (request.args.get("year") or "").strip()
+    if year:
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT strftime('%m', created_at) AS m, "
+            "COALESCE(SUM(total),0) AS revenue, COUNT(*) AS count "
+            "FROM sales WHERE strftime('%Y', created_at)=? GROUP BY m",
+            (year,),
+        ).fetchall()
+        conn.close()
+        by_month = {r["m"]: r for r in rows}
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = f"Doanh thu {year}"
+        ws.append(["Tháng", "Số đơn", "Doanh thu"])
+        for c in ws[1]:
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = head_fill
+            c.alignment = Alignment(horizontal="center")
+
+        year_total = 0
+        for i in range(1, 13):
+            r = by_month.get(f"{i:02d}")
+            rev = r["revenue"] if r else 0
+            cnt = r["count"] if r else 0
+            year_total += rev
+            ws.append([f"Tháng {i}", cnt, rev])
+
+        ws.append([])
+        ws.append(["Tổng cả năm", "", year_total])
+        for c in ws[ws.max_row]:
+            c.font = Font(bold=True)
+
+        ws.column_dimensions["A"].width = 16
+        ws.column_dimensions["B"].width = 12
+        ws.column_dimensions["C"].width = 18
+        for row in ws.iter_rows(min_row=2, min_col=3, max_col=3):
+            for c in row:
+                if isinstance(c.value, (int, float)):
+                    c.number_format = "#,##0"
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return send_file(
+            buf,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=f"doanh-thu-nam-{year}.xlsx",
+        )
 
     day = (request.args.get("date") or "").strip()  # rỗng hoặc "all" = tất cả
 
@@ -344,6 +451,22 @@ def export_excel():
 # ---------------------------------------------------------------------------
 # API sổ nợ
 # ---------------------------------------------------------------------------
+@app.route("/api/debtors", methods=["GET"])
+def list_debtors():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT s.debtor_phone AS phone, "
+        "COALESCE(SUM(s.total),0) - "
+        "COALESCE((SELECT SUM(amount) FROM debt_payments p WHERE p.phone = s.debtor_phone),0) "
+        "AS remaining "
+        "FROM sales s WHERE s.debtor_phone IS NOT NULL "
+        "GROUP BY s.debtor_phone HAVING remaining > 0 "
+        "ORDER BY remaining DESC LIMIT 50"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
 @app.route("/api/debt/<phone>", methods=["GET"])
 def get_debt(phone):
     phone = phone.strip()
@@ -527,6 +650,19 @@ PAGE = r"""
   .empty-row td{text-align:center;color:var(--muted);padding:30px}
 
   /* ====== LỊCH SỬ ====== */
+  .year-block{border:1px solid var(--line);border-radius:var(--radius);background:#fff;padding:18px;margin-bottom:8px}
+  .year-head{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-bottom:18px}
+  .month-grid{display:grid;grid-template-columns:repeat(12,1fr);gap:8px}
+  .month-cell{text-align:center}
+  .month-name{font-size:12px;color:var(--muted);margin-bottom:6px}
+  .month-bar{height:90px;background:var(--surface);border-radius:6px;display:flex;align-items:flex-end;overflow:hidden}
+  .month-fill{width:100%;background:var(--accent);border-radius:6px 6px 0 0;transition:height .3s;min-height:2px}
+  .month-rev{font-size:11px;margin-top:6px;font-weight:600}
+  .month-cnt{font-size:11px;color:var(--muted)}
+  @media(max-width:760px){
+    .month-grid{grid-template-columns:repeat(6,1fr)}
+    .month-rev{font-size:10px}
+  }
   .hist-top{display:flex;gap:14px;align-items:flex-end;margin-bottom:18px;flex-wrap:wrap}
   .hist-pick label{display:block;font-size:13px;color:var(--muted);margin-bottom:4px}
   .hist-pick select{padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:#fff;
@@ -564,6 +700,14 @@ PAGE = r"""
   .pay-history{border:1px solid var(--line);border-radius:var(--radius);background:#fff;padding:10px 14px}
   .pay-history .bill-item{border-bottom:1px solid var(--surface)}
   @media(max-width:760px){.debt-cols{grid-template-columns:1fr}}
+  .debtor-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;margin-bottom:18px}
+  .debtor-row{display:flex;align-items:center;gap:12px;border:1px solid var(--line);border-radius:var(--radius);
+    background:#fff;padding:12px 14px;cursor:pointer;text-align:left;font-family:inherit;font-size:15px;transition:.12s}
+  .debtor-row:hover{border-color:var(--danger);background:#fdf2f2}
+  .debtor-rank{width:24px;height:24px;flex:none;border-radius:50%;background:var(--surface);color:var(--muted);
+    display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600}
+  .debtor-phone{flex:1;font-weight:550}
+  .debtor-amt{color:var(--danger);font-weight:700}
 
   /* toast */
   #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);
@@ -621,7 +765,7 @@ PAGE = r"""
         <h2 id="formTitle">Thêm sản phẩm</h2>
         <input type="hidden" id="pid">
         <div class="field"><label>Tên sản phẩm</label><input id="f-name" autocomplete="off"></div>
-        <div class="field"><label>Mã vạch / SKU</label><input id="f-barcode" autocomplete="off"></div>
+        <div class="field"><label>Mã vạch / SKU</label><input id="f-barcode" placeholder="Quét hoặc nhập mã…" autocomplete="off"></div>
         <div class="field"><label>Giá bán (₫)</label><input id="f-price" inputmode="numeric" autocomplete="off"></div>
         <div class="field"><label>Tồn kho</label><input id="f-stock" inputmode="numeric" autocomplete="off"></div>
         <div class="form-actions">
@@ -644,6 +788,28 @@ PAGE = r"""
 
   <!-- ================= LỊCH SỬ ================= -->
   <section id="view-hist" class="hide">
+
+    <!-- Doanh thu theo năm -->
+    <div class="year-block">
+      <div class="year-head">
+        <div class="hist-pick">
+          <label>Doanh thu năm</label>
+          <select id="yearPick" onchange="loadYearly(this.value)"></select>
+        </div>
+        <div class="stat">
+          <div class="stat-lbl">Tổng doanh thu năm</div>
+          <div class="stat-val num" id="yearTotal">0 ₫</div>
+        </div>
+        <div class="stat">
+          <div class="stat-lbl">Số đơn cả năm</div>
+          <div class="stat-val num" id="yearCount">0</div>
+        </div>
+        <button class="btn" style="margin-left:auto" onclick="exportYear()">Xuất Excel năm này</button>
+      </div>
+      <div id="monthGrid" class="month-grid"></div>
+    </div>
+
+    <h2 style="margin-top:24px">Chi tiết theo ngày</h2>
     <div class="hist-top">
       <div class="hist-pick">
         <label>Xem ngày</label>
@@ -672,6 +838,7 @@ PAGE = r"""
              onkeydown="if(event.key==='Enter')lookupDebt()">
       <button class="btn" onclick="lookupDebt()">Tra cứu</button>
     </div>
+    <div id="debtList"></div>
     <div id="debtResult"></div>
   </section>
 </main>
@@ -695,8 +862,8 @@ function showTab(name){
   document.getElementById('tab-debt').classList.toggle('active', name==='debt');
   if(name==='sale'){ loadSaleList(); document.getElementById('scan').focus(); }
   else if(name==='prod'){ loadProducts(); }
-  else if(name==='hist'){ loadSales(); }
-  else if(name==='debt'){ document.getElementById('debtPhone').focus(); }
+  else if(name==='hist'){ loadSales(); loadYearly(); }
+  else if(name==='debt'){ document.getElementById('debtPhone').focus(); loadDebtors(); }
 }
 
 /* ---------- BÁN HÀNG ---------- */
@@ -812,7 +979,31 @@ document.addEventListener('DOMContentLoaded',()=>{
       if((el.value || '').trim().length >= 6) processScan();   // đủ dài mới tự thêm (mã vạch thường 8–13 số)
     }, 120);
   });
+
+  // ô Mã vạch trong form Sản phẩm: cũng nhận máy quét
+  const bc = document.getElementById('f-barcode');
+  bc.addEventListener('keydown', e=>{
+    if(e.key === 'Enter'){ e.preventDefault(); clearTimeout(barcodeTimer); processFormBarcode(); }
+  });
+  bc.addEventListener('input', ()=>{
+    clearTimeout(barcodeTimer);
+    barcodeTimer = setTimeout(()=>{
+      if((bc.value || '').trim().length >= 6) processFormBarcode();
+    }, 120);
+  });
 });
+
+// xử lý mã vạch quét vào form Sản phẩm
+let barcodeTimer = null;
+let lastBarcode = '';
+function processFormBarcode(){
+  const code = (document.getElementById('f-barcode').value || '').trim();
+  if(!code || code === lastBarcode) return;   // tránh xử lý lặp cùng một mã
+  lastBarcode = code;
+  api('/api/products/barcode/' + encodeURIComponent(code))
+    .then(p=>{ editProduct(p); toast('Mã này đã có — đang sửa "' + p.name + '"'); })
+    .catch(()=>{ toast('Mã mới — nhập tên & giá'); document.getElementById('f-name').focus(); });
+}
 
 /* ---------- SẢN PHẨM ---------- */
 function loadProducts(q=''){
@@ -869,6 +1060,7 @@ function resetForm(){
   ['f-name','f-barcode','f-price','f-stock'].forEach(i=>document.getElementById(i).value='');
   document.getElementById('formTitle').textContent='Thêm sản phẩm';
   document.getElementById('cancelEdit').style.display='none';
+  lastBarcode='';
 }
 
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -921,8 +1113,66 @@ function exportExcel(all){
   window.location.href = url;   // trình duyệt tải file Excel về
 }
 
+/* ---------- DOANH THU THEO NĂM ---------- */
+let currentYear = '';
+const MONTH_NAMES = ['Th1','Th2','Th3','Th4','Th5','Th6','Th7','Th8','Th9','Th10','Th11','Th12'];
+
+function loadYearly(year){
+  const url = '/api/revenue/yearly' + (year ? ('?year=' + encodeURIComponent(year)) : '');
+  api(url).then(d=>{
+    currentYear = d.year;
+    document.getElementById('yearTotal').textContent = fmt(d.total);
+    document.getElementById('yearCount').textContent = d.count;
+
+    const sel = document.getElementById('yearPick');
+    const opts = (d.years && d.years.length) ? d.years.slice() : [d.year];
+    if(!opts.includes(d.year)) opts.unshift(d.year);
+    sel.innerHTML = opts.map(y=>`<option value="${y}" ${y===d.year?'selected':''}>${y}</option>`).join('');
+
+    const max = Math.max(1, ...d.months.map(m=>m.revenue));
+    document.getElementById('monthGrid').innerHTML = d.months.map((m,idx)=>{
+      const pct = Math.round(m.revenue / max * 100);
+      return `<div class="month-cell">
+        <div class="month-name">${MONTH_NAMES[idx]}</div>
+        <div class="month-bar"><div class="month-fill" style="height:${pct}%"></div></div>
+        <div class="month-rev num">${m.revenue ? fmt(m.revenue) : '—'}</div>
+        <div class="month-cnt num">${m.count} đơn</div>
+      </div>`;
+    }).join('');
+  });
+}
+
+function exportYear(){
+  window.location.href = '/api/export?year=' + encodeURIComponent(currentYear);
+}
+
 /* ---------- SỔ NỢ ---------- */
 let debtPhone = '';
+
+function loadDebtors(){
+  api('/api/debtors').then(list=>{
+    const box=document.getElementById('debtList');
+    if(!list.length){
+      box.innerHTML='<div class="cempty">Hiện không có ai đang nợ</div>';
+      return;
+    }
+    box.innerHTML='<h2>Đang nợ ('+list.length+')</h2>'+
+      '<div class="debtor-list">'+
+      list.map((d,i)=>`
+        <button class="debtor-row" onclick="openDebtor('${esc(d.phone)}')">
+          <span class="debtor-rank">${i+1}</span>
+          <span class="debtor-phone">${esc(d.phone)}</span>
+          <span class="debtor-amt num">${fmt(d.remaining)}</span>
+        </button>`).join('')+
+      '</div>';
+  });
+}
+
+function openDebtor(phone){
+  document.getElementById('debtPhone').value=phone;
+  lookupDebt();
+  document.getElementById('debtResult').scrollIntoView({behavior:'smooth',block:'start'});
+}
 
 function lookupDebt(){
   const phone=(document.getElementById('debtPhone').value||'').trim();
@@ -975,7 +1225,7 @@ function payDebt(){
     headers:{'Content-Type':'application/json'},body:JSON.stringify({amount})})
     .then(r=>{
       toast(r.remaining<=0 ? 'Đã trả hết nợ' : 'Đã ghi nhận · Còn nợ '+fmt(r.remaining));
-      lookupDebt();
+      lookupDebt(); loadDebtors();
     }).catch(e=>toast(e.error||'Lỗi'));
 }
 
