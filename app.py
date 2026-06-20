@@ -767,10 +767,12 @@ PAGE = r"""
   .btn:disabled{opacity:.4;cursor:not-allowed}
 
   /* ====== BÁN HÀNG ====== */
-  .sale{display:grid;grid-template-columns:1fr 380px;gap:22px;align-items:start}
+  .sale{display:grid;grid-template-columns:1fr 380px;gap:22px;align-items:stretch;height:calc(100vh - 100px)}
+  .sale > div{display:flex;flex-direction:column;min-height:0}
   .scan{display:flex;gap:10px;margin-bottom:16px}
   .scan input{flex:1}
-  .plist{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+  .plist{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;
+    flex:1;overflow-y:auto;min-height:0;align-content:start;padding-right:4px}
   .pcard{
     border:1px solid var(--line);border-radius:var(--radius);padding:12px;
     cursor:pointer;background:#fff;text-align:left;transition:.12s;
@@ -782,10 +784,10 @@ PAGE = r"""
 
   .cart{
     border:1px solid var(--line);border-radius:var(--radius);
-    background:#fff;position:sticky;top:22px;overflow:hidden;
+    background:#fff;display:flex;flex-direction:column;min-height:0;overflow:hidden;
   }
-  .cart .ch{padding:14px 16px;border-bottom:1px solid var(--line);font-weight:600}
-  .citems{max-height:320px;overflow:auto}
+  .cart .ch{padding:14px 16px;border-bottom:1px solid var(--line);font-weight:600;flex-shrink:0}
+  .citems{flex:1;overflow-y:auto;min-height:0}   /* danh sách món cuộn riêng */
   .citem{display:flex;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--surface)}
   .citem .ci-n{flex:1;min-width:0}
   .citem .ci-n div:first-child{font-weight:500;font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -797,7 +799,7 @@ PAGE = r"""
   .qty span{min-width:20px;text-align:center}
   .ci-rm{border:0;background:none;color:var(--danger);cursor:pointer;font-size:18px;line-height:1;padding:0 2px}
   .cempty{padding:40px 16px;text-align:center;color:var(--muted)}
-  .csum{padding:14px 16px;border-top:1px solid var(--line)}
+  .csum{padding:14px 16px;border-top:1px solid var(--line);flex-shrink:0}
   .row{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
   .row .lbl{color:var(--muted)}
   .total .lbl{font-weight:600;color:var(--ink)}
@@ -935,11 +937,6 @@ PAGE = r"""
         <div id="cartItems" class="citems"></div>
         <div class="csum">
           <div class="row total"><span class="lbl">Tổng cộng</span><span id="total" class="val num">0 ₫</span></div>
-          <div class="row"><span class="lbl">Khách đưa</span>
-            <input id="paid" class="field-inline pay-input num" inputmode="numeric" placeholder="0" oninput="onPaid()"
-                   style="padding:7px 10px;border:1px solid var(--line);border-radius:8px;outline:none">
-          </div>
-          <div class="row change"><span class="lbl">Tiền thối</span><span id="change" class="val num">0 ₫</span></div>
           <button id="payBtn" class="btn" style="width:100%;margin-top:6px" onclick="checkout()" disabled>Thanh toán</button>
           <button id="debtBtn" class="btn btn-debt" style="width:100%;margin-top:8px" onclick="checkoutDebt()" disabled>Ghi nợ</button>
           <button class="btn ghost" style="width:100%;margin-top:8px" onclick="clearCart()">Xoá giỏ</button>
@@ -1120,10 +1117,17 @@ function loadSaleList(){
 }
 
 function addToCart(p){
-  const f = cart.find(i=>i.id===p.id);
-  if(f) f.qty++;
-  else cart.push({id:p.id,name:p.name,price:p.price,qty:1});
+  const idx = cart.findIndex(i=>i.id===p.id);
+  if(idx>=0){
+    cart[idx].qty++;
+    const item = cart.splice(idx,1)[0];   // đưa món vừa quét xuống cuối để dễ thấy
+    cart.push(item);
+  } else {
+    cart.push({id:p.id,name:p.name,price:p.price,qty:1});
+  }
   renderCart();
+  const box = document.getElementById('cartItems');
+  if(box) box.scrollTop = box.scrollHeight;   // tự cuộn xuống món vừa quét
 }
 function changeQty(id,delta){
   const i=cart.find(x=>x.id===id); if(!i)return;
@@ -1131,7 +1135,7 @@ function changeQty(id,delta){
   renderCart();
 }
 function removeItem(id){cart=cart.filter(x=>x.id!==id);renderCart();}
-function clearCart(){cart=[];document.getElementById('paid').value='';renderCart();}
+function clearCart(){cart=[];renderCart();}
 
 function renderCart(){
   const box=document.getElementById('cartItems');
@@ -1153,7 +1157,6 @@ function renderCart(){
   }
   const total=cart.reduce((s,i)=>s+i.price*i.qty,0);
   document.getElementById('total').textContent=fmt(total);
-  onPaid();
   document.getElementById('payBtn').disabled = cart.length===0;
   document.getElementById('debtBtn').disabled = cart.length===0;
   focusScan();
@@ -1168,15 +1171,6 @@ function focusScan(){
   if(document.getElementById('newProductModal').classList.contains('show')) return;
   if(document.getElementById('changePwModal').classList.contains('show')) return;
   el.focus();
-}
-
-function onPaid(){
-  const total=cart.reduce((s,i)=>s+i.price*i.qty,0);
-  const paid=parseInt((document.getElementById('paid').value||'').replace(/\D/g,''))||0;
-  const change=paid-total;
-  const el=document.getElementById('change');
-  el.textContent = change>=0 ? fmt(change) : '—';
-  el.style.color = change>=0 ? 'var(--accent)' : 'var(--danger)';
 }
 
 function editCartPrice(id){
@@ -1197,12 +1191,10 @@ function editCartPrice(id){
 
 function checkout(){
   const total=cart.reduce((s,i)=>s+i.price*i.qty,0);
-  const paid=parseInt((document.getElementById('paid').value||'').replace(/\D/g,''))||0;
-  if(paid && paid<total){toast('Khách đưa chưa đủ tiền');return;}
   api('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({items:cart,paid:paid||total})})
-    .then(r=>{
-      toast(r.change>0 ? 'Đã thanh toán · Thối '+fmt(r.change) : 'Đã thanh toán');
+    body:JSON.stringify({items:cart,paid:total})})
+    .then(()=>{
+      toast('Đã thanh toán');
       clearCart(); loadSaleList();
     }).catch(e=>toast(e.error||'Lỗi thanh toán'));
 }
@@ -1295,6 +1287,14 @@ document.addEventListener('DOMContentLoaded',()=>{
     scanTimer = setTimeout(()=>{
       if((el.value || '').trim().length >= 6) processScan();   // đủ dài mới tự thêm (mã vạch thường 8–13 số)
     }, 120);
+  });
+  // luôn giữ con trỏ ở ô quét: bấm vùng trống thì tự về, bấm ô nhập khác thì tôn trọng
+  el.addEventListener('blur', ()=>{
+    setTimeout(()=>{
+      const a = document.activeElement;
+      if(a && ['INPUT','TEXTAREA','SELECT'].includes(a.tagName)) return;  // đang gõ ô khác -> để yên
+      focusScan();
+    }, 0);
   });
 
   // ô Mã vạch trong form Sản phẩm: cũng nhận máy quét
