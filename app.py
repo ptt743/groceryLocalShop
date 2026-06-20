@@ -1176,12 +1176,19 @@ function checkoutDebt(){
 
 // quét mã vạch: tự tìm sản phẩm và thêm vào giỏ, KHÔNG cần Enter
 let scanTimer = null;
+let lastScanCode = '';
+let lastScanAt = 0;
 
 function processScan(){
   const el = document.getElementById('scan');
   const code = (el.value || '').trim();
-  el.value = '';                 // xoá ngay để tránh xử lý trùng (lần gọi sau thấy rỗng sẽ bỏ qua)
+  el.value = '';                 // xoá ngay để tránh xử lý trùng
   if(!code) return;
+  // chống quét đúp: cùng một mã trong vòng 400ms chỉ tính 1 lần
+  const now = Date.now();
+  if(code === lastScanCode && (now - lastScanAt) < 400) return;
+  lastScanCode = code;
+  lastScanAt = now;
   api('/api/products/barcode/' + encodeURIComponent(code))
     .then(p=>{ addToCart(p); toast('Đã thêm ' + p.name); el.focus(); })
     .catch(()=>{
@@ -1233,10 +1240,12 @@ document.addEventListener('DOMContentLoaded',()=>{
   const el = document.getElementById('scan');
   // nếu máy quét có gửi Enter -> xử lý ngay lập tức
   el.addEventListener('keydown', e=>{
+    if(e.isComposing || e.keyCode === 229) return;   // bộ gõ tiếng Việt đang ghép ký tự -> bỏ qua
     if(e.key === 'Enter'){ e.preventDefault(); clearTimeout(scanTimer); processScan(); }
   });
   // nếu máy quét KHÔNG gửi Enter -> tự xử lý khi dòng ký tự ngừng lại
-  el.addEventListener('input', ()=>{
+  el.addEventListener('input', e=>{
+    if(e.isComposing) return;                          // bỏ qua sự kiện khi bộ gõ đang ghép
     clearTimeout(scanTimer);
     scanTimer = setTimeout(()=>{
       if((el.value || '').trim().length >= 6) processScan();   // đủ dài mới tự thêm (mã vạch thường 8–13 số)
@@ -1246,9 +1255,11 @@ document.addEventListener('DOMContentLoaded',()=>{
   // ô Mã vạch trong form Sản phẩm: cũng nhận máy quét
   const bc = document.getElementById('f-barcode');
   bc.addEventListener('keydown', e=>{
+    if(e.isComposing || e.keyCode === 229) return;   // bộ gõ tiếng Việt đang ghép -> bỏ qua
     if(e.key === 'Enter'){ e.preventDefault(); clearTimeout(barcodeTimer); processFormBarcode(); }
   });
-  bc.addEventListener('input', ()=>{
+  bc.addEventListener('input', e=>{
+    if(e.isComposing) return;
     clearTimeout(barcodeTimer);
     barcodeTimer = setTimeout(()=>{
       if((bc.value || '').trim().length >= 6) processFormBarcode();
