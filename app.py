@@ -241,6 +241,19 @@ def update_product(pid):
     return jsonify(dict(row))
 
 
+@app.route("/api/products/<int:pid>/price", methods=["POST"])
+def update_price(pid):
+    d = request.get_json(force=True)
+    price = int(d.get("price") or 0)
+    if price <= 0:
+        return jsonify({"error": "Giá không hợp lệ"}), 400
+    conn = get_db()
+    conn.execute("UPDATE products SET price=? WHERE id=?", (price, pid))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/products/<int:pid>", methods=["DELETE"])
 def delete_product(pid):
     conn = get_db()
@@ -775,8 +788,10 @@ PAGE = r"""
   .citems{max-height:320px;overflow:auto}
   .citem{display:flex;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--surface)}
   .citem .ci-n{flex:1;min-width:0}
-  .citem .ci-n div:first-child{font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .citem .ci-n div:first-child{font-weight:500;font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .citem .ci-n div:last-child{font-size:12px;color:var(--muted)}
+  .ci-price{cursor:pointer;color:var(--accent)!important;font-size:19px!important;font-weight:700!important;display:inline-block;border-radius:5px;padding:2px 5px;margin-top:3px}
+  .ci-price:hover{background:var(--accent-soft)}
   .qty{display:flex;align-items:center;gap:6px}
   .qty button{width:26px;height:26px;border:1px solid var(--line);background:#fff;border-radius:6px;cursor:pointer}
   .qty span{min-width:20px;text-align:center}
@@ -1125,7 +1140,9 @@ function renderCart(){
   } else {
     box.innerHTML=cart.map(i=>`
       <div class="citem">
-        <div class="ci-n"><div>${esc(i.name)}</div><div class="num">${fmt(i.price)}</div></div>
+        <div class="ci-n"><div>${esc(i.name)}</div>
+          <div class="ci-price num" onclick="editCartPrice(${i.id})" title="Bấm để sửa giá">${fmt(i.price)} ✎</div>
+        </div>
         <div class="qty">
           <button onclick="changeQty(${i.id},-1)">−</button>
           <span class="num">${i.qty}</span>
@@ -1139,6 +1156,18 @@ function renderCart(){
   onPaid();
   document.getElementById('payBtn').disabled = cart.length===0;
   document.getElementById('debtBtn').disabled = cart.length===0;
+  focusScan();
+}
+
+// đưa con trỏ về ô quét để tiếp tục bán (bỏ qua khi đang mở hộp thoại / ở tab khác)
+function focusScan(){
+  const el = document.getElementById('scan');
+  if(!el) return;
+  if(document.getElementById('view-sale').classList.contains('hide')) return;
+  if(document.getElementById('loginScreen').classList.contains('show')) return;
+  if(document.getElementById('newProductModal').classList.contains('show')) return;
+  if(document.getElementById('changePwModal').classList.contains('show')) return;
+  el.focus();
 }
 
 function onPaid(){
@@ -1148,6 +1177,22 @@ function onPaid(){
   const el=document.getElementById('change');
   el.textContent = change>=0 ? fmt(change) : '—';
   el.style.color = change>=0 ? 'var(--accent)' : 'var(--danger)';
+}
+
+function editCartPrice(id){
+  const item = cart.find(x=>x.id===id);
+  if(!item) return;
+  const input = prompt('Giá bán mới cho "'+item.name+'":', item.price);
+  if(input===null) return;                       // bấm Huỷ
+  const newPrice = parseInt((input||'').replace(/\D/g,''))||0;
+  if(newPrice<=0){ toast('Giá không hợp lệ'); return; }
+  item.price = newPrice;                          // cập nhật đơn đang bán
+  renderCart();
+  // lưu giá mới xuống kho để lần sau bán dùng giá này
+  api('/api/products/'+id+'/price',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({price:newPrice})})
+    .then(()=>{ toast('Đã cập nhật giá'); loadSaleList(); })
+    .catch(()=> toast('Đã đổi giá cho đơn này (chưa lưu được vào kho)'));
 }
 
 function checkout(){

@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Dữ liệu (không commit database)
+shop.db
+data/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# PyInstaller (bản build)
+build/
+dist/
+*.spec
+
+# Editor
+.vscode/
+.idea/
